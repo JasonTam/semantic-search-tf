@@ -1,36 +1,81 @@
 import pandas as pd
 import numpy as np
-import scipy.sparse as sp
 import tensorflow as tf
 import itertools as it
-import pickle
-import os
-
+from typing import Sized, Dict, Sequence
 from tensorflow.contrib.tensorboard.plugins import projector
 
-from time import time
 
 LOG_DIR = '/tmp/tensorboard-logs/semantic/'
 
 
-def get_win(seq, win_size=4):
+def get_win(seq: Sequence, win_size: int=4) -> Sequence:
+    """ Extracts a contiguous window of data from a sequence
+
+    Parameters
+    ----------
+    seq
+        Sequence to extract from
+    win_size
+        Window size
+
+    Returns
+    -------
+    win_seq
+        Windowed Sequence
+    """
     ii = np.random.randint(0, max(0, len(seq) - win_size) + 1)
-    return seq[ii:ii + win_size]
+    win_seq = seq[ii:ii + win_size]
+    return win_seq
 
 
 class Model(object):
     def __init__(self,
-                 vocab,
-                 n_entities,
-                 word_emb_size=64,
-                 entity_emb_size=16,
-                 n_negs_per_pos=10,
-                 l2_emb=1e-2,
-                 l2_map=1e-2,
-                 batch_size=1024,
-                 opt=tf.train.AdamOptimizer(
+                 vocab: Sized,
+                 n_entities: int,
+                 word_emb_size: int=64,
+                 entity_emb_size: int=16,
+                 n_negs_per_pos: int=10,
+                 l2_emb: float=1e-2,
+                 l2_map: float=1e-2,
+                 batch_size: int=1024,
+                 opt: tf.train.Optimizer=tf.train.AdamOptimizer(
                      learning_rate=0.001, beta1=0.9, beta2=0.999),
                  ):
+        """
+        Model for training word and entity embeddings for entity retrieval as
+        formulated by [1]_
+
+
+        Parameters
+        ----------
+        vocab
+            Word vocabulary
+        n_entities
+            Number of entities in catalog
+        word_emb_size
+            Size of word embeddings
+        entity_emb_size
+            Size of entity embeddings
+        n_negs_per_pos
+            Number of negatives to sample per positive
+        l2_emb
+            L2 regularization scale for embeddings parameters
+        l2_map
+            L2 regularization scale for mapping layer weights
+        batch_size
+            Feed batch size
+        opt
+            Training optimizer
+
+        References
+        ----------
+        .. [1] Van Gysel, Christophe, Maarten de Rijke, and Evangelos Kanoulas.
+           "Learning latent vector spaces for product search." Proceedings of
+           the 25th ACM International on Conference on Information and
+           Knowledge Management. ACM, 2016.
+
+        """
 
         self.vocab = vocab
         self.n_entities = n_entities
@@ -44,6 +89,7 @@ class Model(object):
 
         self.opt = opt
         self.ph_d = {}
+        self.embs_d = {}
 
         self.loss = self.build_loss_graph()
         self.train_op = self.get_train_op()
@@ -66,6 +112,8 @@ class Model(object):
                 initializer=None,  # use default glorot
                 regularizer=reg_emb
             )
+            self.embs_d['word'] = word_embs
+            self.embs_d['entity'] = entity_embs
 
         with tf.variable_scope('ph'):
             ngram_ph = tf.sparse_placeholder(tf.int32)
@@ -112,7 +160,8 @@ class Model(object):
             name='neg_scores')
 
         loss = tf.reduce_mean(
-            tf.log(pos_score) + tf.reduce_sum(tf.log(1. - neg_scores), axis=-1),
+            tf.log(pos_score) +
+            tf.reduce_sum(tf.log(1. - neg_scores),axis=-1),
             name='loss_mnce'
         )
 
@@ -130,9 +179,11 @@ class Model(object):
         return train_op
 
 
-def win_gen(data_words_enc, entity_codes, n_entities, n_negs_per_pos,
-                 ph_d,
-                 batch_size):
+def win_gen(data_words_enc: pd.DataFrame,
+            entity_codes: np.array, n_entities: int,
+            n_negs_per_pos: int,
+            ph_d: Dict[str, tf.Tensor],
+            batch_size: int):
     # note: actually we should be uniformly sampling over entities
     # rather than documents
     while True:
@@ -150,8 +201,6 @@ def win_gen(data_words_enc, entity_codes, n_entities, n_negs_per_pos,
                 *([(row, col) for col in cols]
                   for row, cols in enumerate(batch_words))))
 
-            # Note: we are supposed to grab a window of words here
-            #     instead of the entire doc
             batch_words_sptv = tf.SparseTensorValue(
                 np.array(batch_words_rows)[:, None],
                 np.array(batch_words_cols, dtype='int32'),
