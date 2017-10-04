@@ -2,11 +2,12 @@ import pandas as pd
 import numpy as np
 import tensorflow as tf
 import itertools as it
-from typing import Sized, Dict, Sequence
-from tensorflow.contrib.tensorboard.plugins import projector
+from typing import Sized, Dict, Sequence, Generator, Any
 
 
 LOG_DIR = '/tmp/tensorboard-logs/semantic/'
+
+BATCH_DIM = None
 
 
 def get_win(seq: Sequence, win_size: int=4) -> Sequence:
@@ -38,7 +39,6 @@ class Model(object):
                  n_negs_per_pos: int=10,
                  l2_emb: float=1e-2,
                  l2_map: float=1e-2,
-                 batch_size: int=1024,
                  opt: tf.train.Optimizer=tf.train.AdamOptimizer(
                      learning_rate=0.001, beta1=0.9, beta2=0.999),
                  ):
@@ -63,8 +63,6 @@ class Model(object):
             L2 regularization scale for embeddings parameters
         l2_map
             L2 regularization scale for mapping layer weights
-        batch_size
-            Feed batch size
         opt
             Training optimizer
 
@@ -85,89 +83,109 @@ class Model(object):
         self.n_negs_per_pos = n_negs_per_pos
         self.l2_emb = l2_emb
         self.l2_map = l2_map
-        self.batch_size = batch_size
 
         self.opt = opt
-        self.ph_d = {}
-        self.embs_d = {}
 
-        self.loss = self.build_loss_graph()
+        # Convenience Dict Accessors
+        self.ph_d = {}
+        self.emb_d = {}
+        self.reg_d = {}
+        self.w2e_xfm = None
+
+        self.init_embs()
+        self.init_phs()
+        self.build_w2e_graph()
+        self.loss_op = self.get_loss_op()
         self.train_op = self.get_train_op()
 
-    def build_loss_graph(self):
-        with tf.variable_scope('reg'):
-            reg_emb = tf.contrib.layers.l2_regularizer(self.l2_emb)
-            reg_map = tf.contrib.layers.l2_regularizer(self.l2_map)
+        self.forward = self.forward_positive
 
+    def init_embs(self):
+        """ Initialize embedding tensors
+        """
+        with tf.variable_scope('reg'):
+            self.reg_d['emb'] = tf.contrib.layers.l2_regularizer(self.l2_emb)
         with tf.variable_scope('emb'):
-            word_embs = tf.get_variable(
+            self.emb_d['word'] = tf.get_variable(
                 name='word',
                 shape=(len(self.vocab), self.word_emb_size),
                 initializer=None,  # use default glorot
-                regularizer=reg_emb
+                regularizer=self.reg_d['emb']
             )
-            entity_embs = tf.get_variable(
+            self.emb_d['entity'] = tf.get_variable(
                 name='item',
                 shape=(self.n_entities, self.entity_emb_size),
                 initializer=None,  # use default glorot
-                regularizer=reg_emb
+                regularizer=self.reg_d['emb']
             )
-            self.embs_d['word'] = word_embs
-            self.embs_d['entity'] = entity_embs
 
+    def init_phs(self):
+        """ Initialize placeholder tensors
+        """
         with tf.variable_scope('ph'):
-            ngram_ph = tf.sparse_placeholder(tf.int32)
-            pos_entity_ph = tf.placeholder(
-                tf.int32, shape=[self.batch_size, 1])
-            neg_entities_ph = tf.placeholder(
-                tf.int32, shape=[self.batch_size, self.n_negs_per_pos])
-            self.ph_d['ngram'] = ngram_ph
-            self.ph_d['pos_entity'] = pos_entity_ph
-            self.ph_d['neg_entities'] = neg_entities_ph
+            self.ph_d['ngram'] = tf.sparse_placeholder(tf.int32)
+            self.ph_d['pos_entity'] = tf.placeholder(
+                tf.int32, shape=[BATCH_DIM, 1])
+            self.ph_d['neg_entities'] = tf.placeholder(
+                tf.int32, shape=[BATCH_DIM, self.n_negs_per_pos])
 
+    def build_w2e_graph(self):
+        """ Graph to transform words to entity-space
+        """
         with tf.variable_scope('looked'):
             agg_looked_word_emb = tf.nn.embedding_lookup_sparse(
-                word_embs, ngram_ph, None, combiner='mean')
+                self.emb_d['word'], self.ph_d['ngram'], None, combiner='mean')
+        with tf.variable_scope('reg'):
+            reg_map = tf.contrib.layers.l2_regularizer(self.l2_map)
+        with tf.variable_scope('xfmer'):
+            self.w2e_xfm = tf.contrib.layers.fully_connected(
+                inputs=agg_looked_word_emb,
+                num_outputs=self.entity_emb_size,
+                activation_fn=tf.nn.tanh,
+                # use default xavier/glorot init
+                weights_regularizer=reg_map,
+                scope='map',
+            )
+
+    def forward_positive(self):
+        with tf.variable_scope('looked'):
             pos_looked_entity_emb = tf.nn.embedding_lookup(
-                entity_embs, pos_entity_ph)
-            neg_looked_entities_emb = tf.nn.embedding_lookup(
-                entity_embs, neg_entities_ph)
+                self.emb_d['entity'], self.ph_d['pos_entity'])
 
-        f = tf.contrib.layers.fully_connected(
-            inputs=agg_looked_word_emb,
-            num_outputs=self.entity_emb_size,
-            activation_fn=tf.nn.tanh,
-            # use default xavier/glorot init
-            weights_regularizer=reg_map,
-            scope='map',
-        )
-
-        pos_score = tf.sigmoid(
-            tf.reduce_sum(
-                tf.multiply(f, tf.squeeze(pos_looked_entity_emb)),
-                axis=-1, keep_dims=False),
+        pos_score = tf.sigmoid(tf.reduce_sum(
+            tf.multiply(self.w2e_xfm, tf.squeeze(pos_looked_entity_emb)),
+            axis=-1, keep_dims=False),
             name='pos_score')
-        neg_scores = tf.sigmoid(
-            tf.reduce_sum(
-                tf.multiply(
-                    tf.reshape(
-                        tf.tile(f, tf.constant([self.n_negs_per_pos, 1])),
-                        shape=[self.batch_size,
-                               self.n_negs_per_pos,
-                               self.entity_emb_size]),
-                    neg_looked_entities_emb),
-                axis=-1, keep_dims=False),
+
+        return pos_score
+
+    def forward_negatives(self):
+        with tf.variable_scope('looked'):
+            neg_looked_entities_emb = tf.nn.embedding_lookup(
+                self.emb_d['entity'], self.ph_d['neg_entities'])
+
+        neg_scores = tf.sigmoid(tf.reduce_sum(
+            tf.multiply(tf.reshape(
+                tf.tile(self.w2e_xfm, tf.constant([self.n_negs_per_pos, 1])),
+                shape=[-1,  # also batch dim
+                       self.n_negs_per_pos,
+                       self.entity_emb_size]),
+                neg_looked_entities_emb),
+            axis=-1, keep_dims=False),
             name='neg_scores')
 
-        loss = tf.reduce_mean(
+        return neg_scores
+
+    def get_loss_op(self):
+        pos_score = self.forward_positive()
+        neg_scores = self.forward_negatives()
+        loss_contrast = tf.reduce_mean(
             tf.log(pos_score) +
-            tf.reduce_sum(tf.log(1. - neg_scores),axis=-1),
+            tf.reduce_sum(tf.log(1. - neg_scores), axis=-1),
             name='loss_mnce'
         )
-
         loss_reg = sum(tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES))
-        loss_tot = loss + loss_reg
-
+        loss_tot = tf.add(loss_contrast, loss_reg, name='loss_tot')
         return loss_tot
 
     def get_train_op(self):
@@ -175,7 +193,7 @@ class Model(object):
             'global_step', shape=[], trainable=False,
             initializer=tf.constant_initializer(0))
 
-        train_op = self.opt.minimize(self.loss, global_step=global_step)
+        train_op = self.opt.minimize(self.loss_op, global_step=global_step)
         return train_op
 
 
@@ -183,9 +201,9 @@ def win_gen(data_words_enc: pd.DataFrame,
             entity_codes: np.array, n_entities: int,
             n_negs_per_pos: int,
             ph_d: Dict[str, tf.Tensor],
-            batch_size: int):
-    # note: actually we should be uniformly sampling over entities
-    # rather than documents
+            batch_size: int) -> Generator[Dict[str, Any]]:
+    # TODO: actually we should be uniformly sampling over entities
+    #   rather than documents
     while True:
         inds = np.random.permutation(np.arange(len(data_words_enc)))
 
